@@ -1,0 +1,110 @@
+   SUBROUTINE RICC_GRAD_TPHP(HNP,T,MPT2VO)
+
+   TYPE(NormH),INTENT(IN)     :: HNP
+   TYPE(WMAT),INTENT(IN)      :: T(2)
+   REAL(KIND=dp),INTENT(INOUT)   :: MPT2VO(:,:,:)
+   REAL(KIND=dp),ALLOCATABLE  :: WPP(:,:),MPT2(:,:)
+   REAL(KIND=dp)              :: DDOT,zz
+   INTEGER,ALLOCATABLE        :: DDIWD(:,:)
+   INTEGER                    :: m,n,mn,e,f,ef,fe,mstrt,mend,mlen,rlo,rhi
+   INTEGER                    :: MemIn,DDI_NP,DDI_ME,Mxthreads,Nthreads,MemThrd
+
+   MemIn = MaxCor
+   !
+   ! DDI is the wrapper for MPI in the software packages GAMESS where this code is integrated. It calls the MPI
+   ! library and utilizes MPI, but the function calls look a bit different. 
+   !
+   call DDI_NPROC(DDI_NP,DDI_ME)          ! Function call to determine number of MPI ranks and give each rank its identity
+
+   call RICC_ialloc20(DDI_NP,2,DDIWD)     ! Function calls to check to see if allocation will fit in memory and then Allocate DDIWD(DDI_NP,2)
+   call RICC_LoopDist(DDIWD,DDI_NP,1,no)  ! Distribute NO across MPI ranks. If NO>#MPI ranks, then assign NO/MPIranks chunks
+                                          ! to the MPI ranks. The chunks of NO given to each MPI ranks is stored in DDIWD.
+
+   mstrt = DDIWD(DDI_ME,1)                ! mstrt is the start of the chunk given to DDI_ME
+   mend  = DDIWD(DDI_ME,2)                ! mend is the end of the chunk given to DDI_ME
+   call RICC_ifree2(DDIWD)                ! Now that each MPI rank "knows" its chunk, we can release DDIWD
+
+   mlen = mend-mstrt+1                    ! Length of chunk for each given rank
+
+!-------------------------------------------------------------------------
+! DDI/MPI ranks in excess of loop iterations should skip the computation
+! below and wait at the exit until other ranks have finished their tasks.
+! In other words, if we have more MPI ranks than NO the idle ranks should
+! skip to the end of this loop.
+!-------------------------------------------------------------------------
+   block_mpi_excess: if(DDI_ME .LE. no-1)then
+
+   Mxthreads = omp_get_max_threads()
+   Nthreads  = MIN(Mxthreads,mlen)      ! Since we are spawning threads over loop mlen, we need to make sure we don't spawn
+                                        ! more threads than we have loops to parallelize.
+
+   call omp_set_dynamic(.false.)        ! This disallows a runtime change in Nthreads since this is determined above for a given
+                                        ! system at runtime.
+!------------------------------------------------------------------------
+! Check available memory and adjust num_threads accordingly
+!------------------------------------------------------------------------
+   MemThrd = nu2 + nu*nauxbas                      ! This is the amount of memory that each thread needs to allocate
+   if(usedm3) MemThrd = MemThrd + nctot*nauxbas
+   do
+     if(Nthreads*MemThrd .LE. MaxCor) EXIT         ! A check to make sure that this amount of memory is available
+     Nthreads = Nthreads-1                         ! and if not we can decrease the number of threads to fit
+   end do                                          ! into memory we have.
+   if(Nthreads .EQ. 0)Nthreads = 1                 ! We need at least one thread.
+   ccnumth(12) = Nthreads                          ! This just stores the number of threads used here to report to the log file.
+
+!$omp parallel default(none) num_threads(Nthreads)                        &
+!$omp shared(no,nu,nauxbas,mstrt,mend,usedm3,HNP,T,MPT2VO)                &
+!$omp private(m,n,mn,e,f,ef,fe,WPP,MPT2)                              &
+!$omp firstprivate(MemThrd)
+
+   call RICC_dalloc2thrd(nu,nu,WPP,MemThrd)
+
+!$omp do schedule(dynamic,1)                       ! Dynamically assign tasks to threads.
+
+   loop_m: do m=mstrt,mend                         ! The spawning of threads happens for each MPI rank with work chunk from mstrt to mend
+
+           loop_n: do n=1,no
+!-------------------------------------------------------------------------
+! Tau~(e,f)_mn = 2T2(ef,mn)-T2(fe,mn)+2T(e,m)T(f,n)-T(f,m)T(e,n)
+!-------------------------------------------------------------------------
+                   do e=1,nu
+                   do f=1,nu
+                      ef = (e-1)*nu+f
+                      fe = (f-1)*nu+e
+                      if(m .GE. n)then
+                        mn = m*(m-1)/2 + n
+                        WPP(e,f) = TWO*T(2)%MAT(ef,mn)-T(2)%MAT(fe,mn)          ! tau(e,f)_mn as 2 index array over loops m,n
+                      else                                                      ! T(2) is stored in lower triangular matrix due to symmetry
+                        mn = n*(n-1)/2 + m                                      ! So we must use a symmetry unpack.
+                        WPP(e,f) = TWO*T(2)%MAT(fe,mn)-T(2)%MAT(ef,mn)
+                      end if
+                      WPP(e,f) = WPP(e,f)+TWO*T(1)%MAT(e,m)*T(1)%MAT(f,n) &
+                                            - T(1)%MAT(f,m)*T(1)%MAT(e,n)
+                   end do
+                   end do
+
+!-------------------------------------------------------------------------
+! Form MPT2: (m)MPT2_(e,P) = \sum_b(n) (m,n)tilde(Tau)_(e,f)*(n)B_(f,P)
+! DGEMM: nu*nu*nauxbas
+!-------------------------------------------------------------------------
+                   call DGEMM('N','N',nu,nauxbas,nu,ONE,WPP,nu,       &       ! Form tau~(e,f)_mn * B(f,P)_n += MPT2VO(e,P,m)
+                              HNP%BmeX(:,:,n),nu,ONE,MPT2VO(:,:,m),nu)
+           end do loop_n
+   end do loop_m
+
+!$omp end do nowait
+   call RICC_dfree2thrd(WPP,MemThrd)
+!$omp end parallel
+
+   end if block_mpi_excess ! Where excess mpi ranks go if work is skipped
+
+   call DDI_GSUMF(3029,MPT2VO,nou*nauxbas) ! A global sum of this quantity is needed since each MPI rank formed its own chunk.
+
+   if(MaxCor .NE. MemIn)then
+     if(maswrk) write(LuOut,7000)MemIn-MaxCor ! Check to make sure that all dynamically allocated memory in this subroutine has been deallocated. 
+   end if                                     ! This makes debugging memory issues easier. 
+
+   7000 format(/,1X,'Warning: Replicated memory leak in RICC_GRAD_TPHP.',/,&
+                 1X,I12,' words remain on the memory stack.',/)
+
+   END SUBROUTINE RICC_GRAD_TPHP
